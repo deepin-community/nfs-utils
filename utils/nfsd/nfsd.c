@@ -32,7 +32,7 @@
 #include "xcommon.h"
 
 #ifndef NFSD_NPROC
-#define NFSD_NPROC 8
+#define NFSD_NPROC 16
 #endif
 
 static void	usage(const char *);
@@ -68,7 +68,7 @@ read_nfsd_conf(void)
 int
 main(int argc, char **argv)
 {
-	int	count = NFSD_NPROC, c, i, error = 0, portnum, fd, found_one;
+	int	count = NFSD_NPROC, c, i, j, error = 0, portnum, fd, found_one;
 	char *p, *progname, *port, *rdma_port = NULL;
 	char **haddr = NULL;
 	char *scope = NULL;
@@ -134,9 +134,10 @@ main(int argc, char **argv)
 		}
 	}
 
-	/* We assume the kernel will default all minor versions to 'on',
-	 * and allow the config file to disable some.
+	/* We assume the kernel will default all minor versions besides '0'
+	 * to 'on', and allow the config file to disable some.
 	 */
+	NFSCTL_MINORUNSET(minorvers, 0);
 	for (i = NFS4_MINMINOR; i <= NFS4_MAXMINOR; i++) {
 		char tag[20];
 		sprintf(tag, "vers4.%d", i);
@@ -330,11 +331,30 @@ main(int argc, char **argv)
 		exit(1);
 	}
 
-	/* make sure that at least one version is enabled */
+	/*
+	 * Make sure that at least one version is enabled.  Note that we might
+	 * need to check the minorvers bit field twice - first while handling
+	 * major version 4 in versbits, and again if no major verions were
+	 * enabled in versbits.
+	 */
 	found_one = 0;
-	for (c = NFSD_MINVERS; c <= NFSD_MAXVERS; c++) {
-		if (NFSCTL_VERISSET(versbits, c))
-			found_one = 1;
+	for (i = NFSD_MINVERS; i <= NFSD_MAXVERS; i++) {
+		if (NFSCTL_VERISSET(versbits, i)) {
+			if (i == 4) {
+				for (j = NFS4_MINMINOR; j <= NFS4_MAXMINOR; j++) {
+					if (NFSCTL_MINORISSET(minorvers, j))
+						found_one = 1;
+				}
+			} else {
+				found_one = 1;
+			}
+		}
+	}
+	if (!found_one) {
+		for (i = NFS4_MINMINOR; i <= NFS4_MAXMINOR; i++) {
+			if (NFSCTL_MINORISSET(minorvers, i))
+				found_one = 1;
+		}
 	}
 	if (!found_one) {
 		xlog(L_ERROR, "no version specified");

@@ -129,6 +129,7 @@
 #include "err_util.h"
 #include "gss_util.h"
 #include "krb5_util.h"
+#include "conffile.h"
 
 /*
  * List of principals from our keytab that we
@@ -154,7 +155,23 @@ static struct gssd_k5_kt_princ *gssd_k5_kt_princ_list = NULL;
 static pthread_mutex_t ple_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #ifdef HAVE_SET_ALLOWABLE_ENCTYPES
-int limit_to_legacy_enctypes = 0;
+/* Encryption types specified in nfs.conf */
+krb5_enctype *allowed_enctypes = NULL;
+int num_allowed_enctypes = 0;
+char *allowed_enctypes_string = NULL;
+
+/* Encryption types permitted by the krb5 library */
+int num_lib_enctypes = 0;
+krb5_enctype *lib_enctypes = NULL;
+char *lib_enctypes_string = NULL;
+
+/*
+ * The final set of encryption types that will be used in
+ * limit_krb5_enctypes().  See determine_enctypes() below.
+ */
+int num_set_enctypes = 0;
+krb5_enctype *set_enctypes = NULL;
+char *set_enctypes_string = NULL;
 #endif
 
 /*==========================*/
@@ -165,7 +182,8 @@ static int select_krb5_ccache(const struct dirent *d);
 static int gssd_find_existing_krb5_ccache(uid_t uid, char *dirname,
 		const char **cctype, struct dirent **d);
 static int gssd_get_single_krb5_cred(krb5_context context,
-		krb5_keytab kt, struct gssd_k5_kt_princ *ple);
+		krb5_keytab kt, struct gssd_k5_kt_princ *ple, int force_renew,
+		krb5_ccache ccache);
 static int query_krb5_ccache(const char* cred_cache, char **ret_princname,
 		char **ret_realm);
 
@@ -304,9 +322,9 @@ gssd_find_existing_krb5_ccache(uid_t uid, char *dirname,
 				score++;
 
 			printerr(3, "CC '%s'(%s@%s) passed all checks and"
-				    " has mtime of %u\n",
+				    " has mtime of %llu\n",
 				 buf, princname, realm, 
-				 tmp_stat.st_mtime);
+				 (long long unsigned)tmp_stat.st_mtime);
 			/*
 			 * if more than one match is found, return the most
 			 * recent (the one with the latest mtime), and
@@ -341,10 +359,10 @@ gssd_find_existing_krb5_ccache(uid_t uid, char *dirname,
 				}
 				printerr(3, "CC '%s:%s/%s' is our "
 					    "current best match "
-					    "with mtime of %u\n",
-					 cctype, dirname,
+					    "with mtime of %llu\n",
+					 *cctype, dirname,
 					 best_match_dir->d_name,
-					 best_match_stat.st_mtime);
+					 (long long unsigned)best_match_stat.st_mtime);
 			}
 			free(princname);
 			free(realm);
@@ -391,21 +409,15 @@ gssd_check_if_cc_exists(struct gssd_k5_kt_princ *ple)
 static int
 gssd_get_single_krb5_cred(krb5_context context,
 			  krb5_keytab kt,
-			  struct gssd_k5_kt_princ *ple)
+			  struct gssd_k5_kt_princ *ple,
+			  int force_renew,
+			  krb5_ccache ccache)
 {
-#ifdef HAVE_KRB5_GET_INIT_CREDS_OPT_SET_ADDRESSLESS
-	krb5_get_init_creds_opt *init_opts = NULL;
-#else
-	krb5_get_init_creds_opt options;
-#endif
-	krb5_get_init_creds_opt *opts;
+	krb5_get_init_creds_opt *opts = NULL;
 	krb5_creds my_creds;
-	krb5_ccache ccache = NULL;
 	char kt_name[BUFSIZ];
-	char cc_name[BUFSIZ];
 	int code;
 	time_t now = time(0);
-	char *cache_type;
 	char *pname = NULL;
 	char *k5err = NULL;
 	int nocache = 0;
@@ -421,7 +433,7 @@ gssd_get_single_krb5_cred(krb5_context context,
 	 */
 	now += 300;
 	pthread_mutex_lock(&ple_lock);
-	if (ple->ccname && ple->endtime > now && !nocache) {
+	if (ple->ccname && ple->endtime > now && !nocache && !force_renew) {
 		printerr(3, "%s(0x%lx): Credentials in CC '%s' are good until %s",
 			 __func__, tid, ple->ccname, ctime((time_t *)&ple->endtime));
 		code = 0;
@@ -439,101 +451,56 @@ gssd_get_single_krb5_cred(krb5_context context,
 	if ((krb5_unparse_name(context, ple->princ, &pname)))
 		pname = NULL;
 
-#ifdef HAVE_KRB5_GET_INIT_CREDS_OPT_SET_ADDRESSLESS
-	code = krb5_get_init_creds_opt_alloc(context, &init_opts);
+	code = krb5_get_init_creds_opt_alloc(context, &opts);
 	if (code) {
 		k5err = gssd_k5_err_msg(context, code);
 		printerr(0, "ERROR: %s allocating gic options\n", k5err);
 		goto out;
 	}
-	if (krb5_get_init_creds_opt_set_addressless(context, init_opts, 1))
+#ifdef HAVE_KRB5_GET_INIT_CREDS_OPT_SET_ADDRESSLESS
+	if (krb5_get_init_creds_opt_set_addressless(context, opts, 1))
 		printerr(1, "WARNING: Unable to set option for addressless "
 			 "tickets.  May have problems behind a NAT.\n");
+#else
+	krb5_get_init_creds_opt_set_address_list(opts, NULL);
+#endif
 #ifdef TEST_SHORT_LIFETIME
 	/* set a short lifetime (for debugging only!) */
 	printerr(1, "WARNING: Using (debug) short machine cred lifetime!\n");
-	krb5_get_init_creds_opt_set_tkt_life(init_opts, 5*60);
-#endif
-	opts = init_opts;
-
-#else	/* HAVE_KRB5_GET_INIT_CREDS_OPT_SET_ADDRESSLESS */
-
-	krb5_get_init_creds_opt_init(&options);
-	krb5_get_init_creds_opt_set_address_list(&options, NULL);
-#ifdef TEST_SHORT_LIFETIME
-	/* set a short lifetime (for debugging only!) */
-	printerr(0, "WARNING: Using (debug) short machine cred lifetime!\n");
-	krb5_get_init_creds_opt_set_tkt_life(&options, 5*60);
-#endif
-	opts = &options;
+	krb5_get_init_creds_opt_set_tkt_life(opts, 5*60);
 #endif
 
+	pthread_mutex_lock(&ple_lock);
+	if ((code = krb5_get_init_creds_opt_set_out_ccache(context, opts,
+							   ccache))) {
+		k5err = gssd_k5_err_msg(context, code);
+		printerr(1, "WARNING: %s while initializing ccache for "
+			 "principal '%s' using keytab '%s'\n", k5err,
+			 pname ? pname : "<unparsable>", kt_name);
+		pthread_mutex_unlock(&ple_lock);
+		goto out;
+	}
 	if ((code = krb5_get_init_creds_keytab(context, &my_creds, ple->princ,
 					       kt, 0, NULL, opts))) {
 		k5err = gssd_k5_err_msg(context, code);
 		printerr(1, "WARNING: %s while getting initial ticket for "
 			 "principal '%s' using keytab '%s'\n", k5err,
 			 pname ? pname : "<unparsable>", kt_name);
+		pthread_mutex_unlock(&ple_lock);
 		goto out;
 	}
 
-	/*
-	 * Initialize cache file which we're going to be using
-	 */
-
-	pthread_mutex_lock(&ple_lock);
-	if (use_memcache)
-	    cache_type = "MEMORY";
-	else
-	    cache_type = "FILE";
-	snprintf(cc_name, sizeof(cc_name), "%s:%s/%s%s_%s",
-		cache_type,
-		ccachesearch[0], GSSD_DEFAULT_CRED_PREFIX,
-		GSSD_DEFAULT_MACHINE_CRED_SUFFIX, ple->realm);
 	ple->endtime = my_creds.times.endtime;
-	if (ple->ccname == NULL || strcmp(ple->ccname, cc_name) != 0) {
-		free(ple->ccname);
-		ple->ccname = strdup(cc_name);
-		if (ple->ccname == NULL) {
-			printerr(0, "ERROR: no storage to duplicate credentials "
-				    "cache name '%s'\n", cc_name);
-			code = ENOMEM;
-			pthread_mutex_unlock(&ple_lock);
-			goto out;
-		}
-	}
 	pthread_mutex_unlock(&ple_lock);
-	if ((code = krb5_cc_resolve(context, cc_name, &ccache))) {
-		k5err = gssd_k5_err_msg(context, code);
-		printerr(0, "ERROR: %s while opening credential cache '%s'\n",
-			 k5err, cc_name);
-		goto out;
-	}
-	if ((code = krb5_cc_initialize(context, ccache, ple->princ))) {
-		k5err = gssd_k5_err_msg(context, code);
-		printerr(0, "ERROR: %s while initializing credential "
-			 "cache '%s'\n", k5err, cc_name);
-		goto out;
-	}
-	if ((code = krb5_cc_store_cred(context, ccache, &my_creds))) {
-		k5err = gssd_k5_err_msg(context, code);
-		printerr(0, "ERROR: %s while storing credentials in '%s'\n",
-			 k5err, cc_name);
-		goto out;
-	}
 
 	code = 0;
-	printerr(2, "%s(0x%lx): principal '%s' ccache:'%s'\n", 
-		__func__, tid, pname, cc_name);
+	printerr(2, "%s(0x%lx): principal '%s' ccache:'%s'\n",
+		__func__, tid, pname, ple->ccname);
   out:
-#ifdef HAVE_KRB5_GET_INIT_CREDS_OPT_SET_ADDRESSLESS
-	if (init_opts)
-		krb5_get_init_creds_opt_free(context, init_opts);
-#endif
+	if (opts)
+		krb5_get_init_creds_opt_free(context, opts);
 	if (pname)
 		k5_free_unparsed_name(context, pname);
-	if (ccache)
-		krb5_cc_close(context, ccache);
 	krb5_free_cred_contents(context, &my_creds);
 	free(k5err);
 	return (code);
@@ -668,6 +635,7 @@ get_full_hostname(const char *inhost, char *outhost, int outhostlen)
 		goto out;
 	}
 	strncpy(outhost, addrs->ai_canonname, outhostlen);
+	outhost[outhostlen - 1] = '\0';
 	nfs_freeaddrinfo(addrs);
 	for (c = outhost; *c != '\0'; c++)
 	    *c = tolower(*c);
@@ -1155,14 +1123,17 @@ err_cache:
 static int
 gssd_refresh_krb5_machine_credential_internal(char *hostname,
 				     struct gssd_k5_kt_princ *ple,
-				     char *service, char *srchost)
+				     char *service, char *srchost,
+				     int force_renew)
 {
 	krb5_error_code code = 0;
 	krb5_context context;
-	krb5_keytab kt = NULL;;
+	krb5_keytab kt = NULL;
+	krb5_ccache ccache = NULL;
 	int retval = 0;
-	char *k5err = NULL;
+	char *k5err = NULL, *cache_type;
 	const char *svcnames[] = { "$", "root", "nfs", "host", NULL };
+	char cc_name[BUFSIZ];
 
 	/*
 	 * If a specific service name was specified, use it.
@@ -1221,7 +1192,38 @@ gssd_refresh_krb5_machine_credential_internal(char *hostname,
 			goto out_free_kt;
 		}
 	}
-	retval = gssd_get_single_krb5_cred(context, kt, ple);
+
+	if (use_memcache)
+		cache_type = "MEMORY";
+	else
+		cache_type = "FILE";
+	snprintf(cc_name, sizeof(cc_name), "%s:%s/%s%s_%s",
+		 cache_type,
+		 ccachesearch[0], GSSD_DEFAULT_CRED_PREFIX,
+		 GSSD_DEFAULT_MACHINE_CRED_SUFFIX, ple->realm);
+
+	pthread_mutex_lock(&ple_lock);
+	if (ple->ccname == NULL || strcmp(ple->ccname, cc_name) != 0) {
+		free(ple->ccname);
+		ple->ccname = strdup(cc_name);
+		if (ple->ccname == NULL) {
+			printerr(0, "ERROR: no storage to duplicate credentials "
+				    "cache name '%s'\n", cc_name);
+			code = ENOMEM;
+			pthread_mutex_unlock(&ple_lock);
+			goto out_free_kt;
+		}
+	}
+	pthread_mutex_unlock(&ple_lock);
+	if ((code = krb5_cc_resolve(context, cc_name, &ccache))) {
+		k5err = gssd_k5_err_msg(context, code);
+		printerr(0, "ERROR: %s while opening credential cache '%s'\n",
+			 k5err, cc_name);
+		goto out_free_kt;
+	}
+
+	retval = gssd_get_single_krb5_cred(context, kt, ple, force_renew, ccache);
+	krb5_cc_close(context, ccache);
 out_free_kt:
 	krb5_kt_close(context, kt);
 out_free_context:
@@ -1344,7 +1346,7 @@ gssd_get_krb5_machine_cred_list(char ***list)
 		pthread_mutex_unlock(&ple_lock);
 		/* Make sure cred is up-to-date before returning it */
 		retval = gssd_refresh_krb5_machine_credential_internal(NULL, ple,
-								       NULL, NULL);
+								       NULL, NULL, 0);
 		pthread_mutex_lock(&ple_lock);
 		if (gssd_k5_kt_princ_list == NULL) {
 			/* Looks like we did shutdown... abort */
@@ -1456,10 +1458,12 @@ gssd_destroy_krb5_principals(int destroy_machine_creds)
  */
 int
 gssd_refresh_krb5_machine_credential(char *hostname,
-				     char *service, char *srchost)
+				     char *service, char *srchost,
+				     int force_renew)
 {
     return gssd_refresh_krb5_machine_credential_internal(hostname, NULL,
-							 service, srchost);
+							 service, srchost,
+							 force_renew);
 }
 
 /*
@@ -1549,7 +1553,314 @@ gssd_acquire_user_cred(gss_cred_id_t *gss_cred)
 	return ret;
 }
 
+/* Removed a service ticket for nfs/<name> from the ticket cache
+ */
+int
+gssd_k5_remove_bad_service_cred(char *name)
+{
+        krb5_creds in_creds, out_creds;
+        krb5_error_code ret;
+        krb5_context context;
+        krb5_ccache cache;
+        krb5_principal principal;
+        int retflags = KRB5_TC_MATCH_SRV_NAMEONLY;
+        char srvname[1024];
+
+        ret = krb5_init_context(&context);
+        if (ret)
+                goto out_cred;
+        ret = krb5_cc_default(context, &cache);
+        if (ret)
+                goto out_free_context;
+        ret = krb5_cc_get_principal(context, cache, &principal);
+        if (ret)
+                goto out_close_cache;
+        memset(&in_creds, 0, sizeof(in_creds));
+        in_creds.client = principal;
+        sprintf(srvname, "nfs/%s", name);
+        ret = krb5_parse_name(context, srvname, &in_creds.server);
+        if (ret)
+                goto out_free_principal;
+        ret = krb5_cc_retrieve_cred(context, cache, retflags, &in_creds, &out_creds);
+        if (ret)
+                goto out_free_principal;
+        ret = krb5_cc_remove_cred(context, cache, 0, &out_creds);
+out_free_principal:
+        krb5_free_principal(context, principal);
+out_close_cache:
+        krb5_cc_close(context, cache);
+out_free_context:
+        krb5_free_context(context);
+out_cred:
+        return ret;
+}
+
+int
+enctypes_list_to_string(krb5_enctype *enctypes, int num_enctypes,
+		        char **enctype_string)
+{
+	char tmp[100], *buf = NULL, *old = NULL;
+	int i, len, ret;
+
+	for (i = 0; i < num_enctypes; i++) {
+		ret = krb5_enctype_to_name(enctypes[i], true, tmp, sizeof(tmp));
+		if (ret == 0) {
+			if (buf == NULL) {
+				len = asprintf(&buf, "%s (%d)", tmp,
+					       enctypes[i]);
+				if (len < 0) {
+					ret = ENOMEM;
+					goto out_err;
+				}
+			} else {
+				old = buf;
+				len = asprintf(&buf, "%s, %s (%d)", old, tmp,
+					       enctypes[i]);
+				if (len < 0) {
+					ret = ENOMEM;
+					goto out_err;
+				}
+				free(old);
+				old = NULL;
+			}
+		} else {
+			printerr(0, "%s: invalid enctype %d",
+				 __func__, enctypes[i]);
+			goto out_err;
+		}
+	}
+	goto out;
+
+out_err:
+	free(buf);
+
+out:
+	if (old != buf)
+		free(old);
+	if (ret == 0)
+		*enctype_string = buf;
+	return ret;
+}
+
 #ifdef HAVE_SET_ALLOWABLE_ENCTYPES
+int
+get_allowed_enctypes(void)
+{
+	struct conf_list *allowed_etypes = NULL;
+	struct conf_list_node *node;
+	int ret = 0;
+
+	allowed_etypes = conf_get_list("gssd", "allowed-enctypes");
+	if (allowed_etypes) {
+		TAILQ_FOREACH(node, &(allowed_etypes->fields), link) {
+			allowed_enctypes = realloc(allowed_enctypes,
+						   (num_allowed_enctypes + 1) *
+						   sizeof(*allowed_enctypes));
+			if (allowed_enctypes == NULL) {
+				ret = ENOMEM;
+				goto out_err;
+			}
+			ret = krb5_string_to_enctype(node->field,
+						     &allowed_enctypes[num_allowed_enctypes]);
+			if (ret) {
+				printerr(0, "%s: invalid enctype %s",
+					 __func__, node->field);
+				goto out_err;
+			}
+			num_allowed_enctypes++;
+		}
+	}
+	if (num_allowed_enctypes > 0) {
+		if (enctypes_list_to_string(allowed_enctypes, num_allowed_enctypes,
+					    &allowed_enctypes_string) != 0) {
+			printerr(2, "%s: warning: enctypes_list_to_string() failed\n",
+				 __func__);
+			goto out;
+		}
+		printerr(2, "%s: config allowed enctypes: %s\n", __func__,
+			 allowed_enctypes_string);
+	}
+	goto out;
+out_err:
+	num_allowed_enctypes = 0;
+	free(allowed_enctypes);
+out:
+	if (allowed_etypes)
+		conf_free_list(allowed_etypes);
+	return ret;
+}
+
+int
+get_krb5_library_permitted_enctypes(void)
+{
+	krb5_error_code code = 0;
+	krb5_context context;
+	char *k5err = NULL;
+	int ret = 0;
+
+	code = krb5_init_context(&context);
+	if (code) {
+		k5err = gssd_k5_err_msg(NULL, code);
+		printerr(2, "ERROR: %s: %s while initializing krb5 context\n",
+			 __func__, k5err);
+		ret = code;
+		goto out;
+	}
+
+	code = krb5_get_permitted_enctypes(context, &lib_enctypes);
+	if (code) {
+		k5err = gssd_k5_err_msg(context, code);
+		printerr(2, "ERROR: %s: %s while getting permitted enctypes\n",
+			 __func__, k5err);
+		ret = code;
+		goto out_free_context;
+	}
+
+	if (lib_enctypes != NULL)
+		while (lib_enctypes[num_lib_enctypes] != 0)
+			num_lib_enctypes++;
+
+	if (num_lib_enctypes > 0) {
+		if (enctypes_list_to_string(lib_enctypes, num_lib_enctypes,
+					    &lib_enctypes_string) != 0) {
+			printerr(2, "%s: warning: enctypes_list_to_string() failed\n",
+				 __func__);
+			goto out_free_context;
+		}
+		printerr(2, "krb5 library permitted enctypes: %s\n",
+			 lib_enctypes_string);
+	}
+
+out_free_context:
+	krb5_free_context(context);
+
+out:
+	free(k5err);
+	return ret;
+}
+
+/*
+ * Helper to determine the final set of enctypes that will be passed to
+ * gss_set_allowable_enctypes() in limit_krb5_enctypes().
+ *
+ * It will be the intersection of:
+ *
+ * 1. allowed_enctypes - If allowed-enctypes is defined in nfs.conf, this is
+ *    processed via get_allowed_enctypes() during gssd startup.
+ * 2. krb5_enctypes - This is the list of enctypes passed in the upcall from
+ *    the kernel, and is processed via handle_gssd_upcall() -> parse_enctypes().
+ * 3. lib_enctypes - Processed via get_krb5_library_permitted_enctypes() during
+ *    gssd startup.
+ *
+ * It will be ordered according to lib_enctypes.  This is necessary because when
+ * the MIT kerberos library does a TGS request it initially does so with
+ * referrals enabled, using its default enctype list instead of the application-
+ * provided one.  It still ensures that the resulting ticket is using an enctype
+ * from the application-provided list, it just might not be the highest priority
+ * enctype from the application-provided list.
+ *
+ * That can result in the machine cred's service ticket using a different
+ * enctype than a user cred's service ticket (particularly in the case of
+ * contrained delegation with gssproxy), which will lead to XDR decoding
+ * failures in the kernel.
+ *
+ * The best way to combat this to configure the krb5 library's
+ * permitted_enctypes list to have the same order as the kernel's
+ * gss_krb5_prepare_enctype_priority_list (which is set at build time), but not
+ * all distros do that.  The second best way is to make sure our list is ordered
+ * according to the krb5 library's list, hence this helper function.
+ */
+static int
+determine_enctypes(krb5_enctype **set_enctypes, int *num_set_enctypes,
+		   char **set_enctypes_string)
+{
+	extern int num_allowed_enctypes, num_krb5_enctypes, num_lib_enctypes;
+	extern krb5_enctype *allowed_enctypes, *krb5_enctypes, *lib_enctypes;
+	extern char *allowed_enctypes_string, *krb5_enctypes_string,
+	       *lib_enctypes_string;
+	krb5_enctype *enctypes;
+	int num_enctypes = 0;
+	char *enctypes_string;
+	int i, j, k;
+
+	if (krb5_enctypes) {
+		printerr(2, "%s: kernel enctypes: %s\n",
+			 __func__, krb5_enctypes_string);
+	} else {
+		printerr(2, "%s: kernel enctype list is empty\n",
+			 __func__);
+		return -1;
+	}
+
+	if (lib_enctypes) {
+		printerr(2, "%s: krb5 library enctypes: %s\n",
+			 __func__, lib_enctypes_string);
+	} else {
+		printerr(2, "%s: krb5 library enctype list is empty\n",
+			 __func__);
+		return -1;
+	}
+
+	if (allowed_enctypes) {
+		printerr(2, "%s: config allowed enctypes: %s\n",
+			 __func__, allowed_enctypes_string);
+	}
+
+	if (allowed_enctypes) {
+		enctypes = (krb5_enctype *) calloc(num_allowed_enctypes,
+						   sizeof(krb5_enctype));
+		if (enctypes == NULL)
+			return ENOMEM;
+		for (i = 0; i < num_lib_enctypes; i++) {
+			for (j = 0; j < num_krb5_enctypes; j++) {
+				if (lib_enctypes[i] == krb5_enctypes[j]) {
+					for (k = 0; k < num_allowed_enctypes; k++) {
+						if (lib_enctypes[i] == allowed_enctypes[k]) {
+							enctypes[num_enctypes++] = lib_enctypes[i];
+							break;
+						}
+					}
+					break;
+				}
+			}
+		}
+	} else {
+		enctypes = (krb5_enctype *) calloc(num_krb5_enctypes,
+						   sizeof(krb5_enctype));
+		if (enctypes == NULL)
+			return ENOMEM;
+		for (i = 0; i < num_lib_enctypes; i++) {
+			for (j = 0; j < num_krb5_enctypes; j++) {
+				if (lib_enctypes[i] == krb5_enctypes[j]) {
+					enctypes[num_enctypes++] = lib_enctypes[i];
+					break;
+				}
+			}
+		}
+	}
+
+	if (num_enctypes > 0) {
+		if (enctypes_list_to_string(enctypes, num_enctypes,
+					    &enctypes_string) != 0) {
+			printerr(2, "%s: warning: enctypes_list_to_string() failed\n",
+				 __func__);
+			return -1;
+		}
+		printerr(2, "%s: result enctypes: %s\n",
+			 __func__, enctypes_string);
+	} else {
+		printerr(2, "%s: no result enctypes\n",
+			 __func__);
+		free(enctypes);
+		return -1;
+	}
+
+	*set_enctypes = enctypes;
+	*num_set_enctypes = num_enctypes;
+	*set_enctypes_string = enctypes_string;
+	return 0;
+}
+
 /*
  * this routine obtains a credentials handle via gss_acquire_cred()
  * then calls gss_krb5_set_allowable_enctypes() to limit the encryption
@@ -1562,17 +1873,13 @@ gssd_acquire_user_cred(gss_cred_id_t *gss_cred)
  *	0 => all went well
  *     -1 => there was an error
  */
-
 int
 limit_krb5_enctypes(struct rpc_gss_sec *sec)
 {
 	u_int maj_stat, min_stat;
-	krb5_enctype enctypes[] = { ENCTYPE_DES_CBC_CRC,
-				    ENCTYPE_DES_CBC_MD5,
-				    ENCTYPE_DES_CBC_MD4 };
-	int num_enctypes = sizeof(enctypes) / sizeof(enctypes[0]);
-	extern int num_krb5_enctypes;
-	extern krb5_enctype *krb5_enctypes;
+	extern int num_set_enctypes;
+	extern krb5_enctype *set_enctypes;
+	extern char *set_enctypes_string;
 	int err = -1;
 
 	if (sec->cred == GSS_C_NO_CREDENTIAL) {
@@ -1581,16 +1888,20 @@ limit_krb5_enctypes(struct rpc_gss_sec *sec)
 			return -1;
 	}
 
-	/*
-	 * If we failed for any reason to produce global
-	 * list of supported enctypes, use local default here.
-	 */
-	if (krb5_enctypes == NULL || limit_to_legacy_enctypes)
-		maj_stat = gss_set_allowable_enctypes(&min_stat, sec->cred,
-					&krb5oid, num_enctypes, enctypes);
-	else
-		maj_stat = gss_set_allowable_enctypes(&min_stat, sec->cred,
-					&krb5oid, num_krb5_enctypes, krb5_enctypes);
+	if (set_enctypes == NULL) {
+		err = determine_enctypes(&set_enctypes, &num_set_enctypes,
+					 &set_enctypes_string);
+		if (err) {
+			printerr(2, "%s: failed to determine set_enctypes\n",
+				 __func__);
+			return -1;
+		}
+	}
+
+	printerr(2, "%s: %s\n", __func__, set_enctypes_string);
+
+	maj_stat = gss_set_allowable_enctypes(&min_stat, sec->cred,
+				&krb5oid, num_set_enctypes, set_enctypes);
 
 	if (maj_stat != GSS_S_COMPLETE) {
 		pgsserr("gss_set_allowable_enctypes",

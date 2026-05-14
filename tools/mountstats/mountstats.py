@@ -140,6 +140,38 @@ XprtRdmaCounters = [
     'reply_waits_for_send',
 ]
 
+# Counters that should be summed across transports when nconnect > 1.
+# Each is stored in a per-transport structure in the kernel
+# (xprt->stat or rpcrdma_xprt.rx_stats) and represents a cumulative
+# event count or utilization value.  Per-connection properties (port,
+# bind_count, connect_count, connect_time, idle_time, maxslots,
+# inflightsends) retain the value from the last transport seen.
+XprtAccumulatedCounters = {
+    'rpcsends',
+    'rpcreceives',
+    'badxids',
+    'backlogutil',
+    'sendutil',
+    'pendutil',
+    'read_segments',
+    'write_segments',
+    'reply_segments',
+    'total_rdma_req',
+    'total_rdma_rep',
+    'pullup',
+    'fixup',
+    'hardway',
+    'failed_marshal',
+    'bad_reply',
+    'nomsg_calls',
+    'recovered_mrs',
+    'orphaned_mrs',
+    'allocated_mrs',
+    'local_invalidates',
+    'empty_sendctx_q',
+    'reply_waits_for_send',
+}
+
 Nfsv3ops = [
     'NULL',
     'GETATTR',
@@ -291,23 +323,22 @@ class DeviceData:
         elif words[0] == 'xprt:':
             self.__rpc_data['protocol'] = words[1]
             if words[1] == 'udp':
-                i = 2
-                for key in XprtUdpCounters:
-                    if i < len(words):
-                        self.__rpc_data[key] = int(words[i])
-                    i += 1
+                counters = XprtUdpCounters
             elif words[1] == 'tcp':
-                i = 2
-                for key in XprtTcpCounters:
-                    if i < len(words):
-                        self.__rpc_data[key] = int(words[i])
-                    i += 1
+                counters = XprtTcpCounters
             elif words[1] == 'rdma':
-                i = 2
-                for key in XprtRdmaCounters:
-                    if i < len(words):
-                        self.__rpc_data[key] = int(words[i])
-                    i += 1
+                counters = XprtRdmaCounters
+            else:
+                counters = []
+            i = 2
+            for key in counters:
+                if i < len(words):
+                    val = int(words[i])
+                    if key in XprtAccumulatedCounters and key in self.__rpc_data:
+                        self.__rpc_data[key] += val
+                    else:
+                        self.__rpc_data[key] = val
+                i += 1
         elif words[0] == 'per-op':
             self.__rpc_data['per-op'] = words
         else:
@@ -332,6 +363,11 @@ class DeviceData:
 
             found = True
             self.__parse_rpc_line(words)
+
+    def fstype(self):
+        """Return the fstype for the mountpoint
+        """
+        return self.__nfs_data['fstype']
 
     def is_nfs_mountpoint(self):
         """Return True if this is an NFS or NFSv4 mountpoint,
@@ -953,73 +989,78 @@ def nfsstat_command(args):
     return 0
 
 def print_iostat_summary(old, new, devices, time):
+    if len(devices) == 0:
+        print('No NFS mount points were found')
+        return
+
     for device in devices:
         stats = DeviceData()
         stats.parse_stats(new[device])
-        if not old or device not in old:
+        if old and device in old:
+            old_stats = DeviceData()
+            old_stats.parse_stats(old[device])
+            if stats.fstype() == old_stats.fstype():
+                stats.compare_iostats(old_stats).display_iostats(time)
+            else: # device is in old, but fstypes are different
+                stats.display_iostats(time)
+        else: # device is only in new
             stats.display_iostats(time)
-        else:
-            if ("fstype autofs" not in str(old[device])) and ("fstype autofs" not in str(new[device])):
-                old_stats = DeviceData()
-                old_stats.parse_stats(old[device])
-                diff_stats = stats.compare_iostats(old_stats)
-                diff_stats.display_iostats(time)
+
+def list_nfs_mounts(givenlist, mountstats):
+    """return a list of NFS mounts given a list to validate or
+       return a full list if the given list is empty -
+       may return an empty list if none found
+    """
+    devicelist = []
+    if len(givenlist) > 0:
+        for device in givenlist:
+            if device in mountstats:
+                stats = DeviceData()
+                stats.parse_stats(mountstats[device])
+                if stats.is_nfs_mountpoint():
+                    devicelist += [device]
+    else:
+        for device, descr in mountstats.items():
+            stats = DeviceData()
+            stats.parse_stats(descr)
+            if stats.is_nfs_mountpoint():
+                devicelist += [device]
+    return devicelist
 
 def iostat_command(args):
     """iostat-like command for NFS mount points
     """
     mountstats = parse_stats_file(args.infile)
-    devices = [os.path.normpath(mp) for mp in args.mountpoints]
+    origdevices = [os.path.normpath(mp) for mp in args.mountpoints]
 
     if args.since:
         old_mountstats = parse_stats_file(args.since)
     else:
         old_mountstats = None
 
-    # make certain devices contains only NFS mount points
-    if len(devices) > 0:
-        check = []
-        for device in devices:
-            stats = DeviceData()
-            try:
-                stats.parse_stats(mountstats[device])
-                if stats.is_nfs_mountpoint():
-                    check += [device]
-            except KeyError:
-                continue
-        devices = check
-    else:
-        for device, descr in mountstats.items():
-            stats = DeviceData()
-            stats.parse_stats(descr)
-            if stats.is_nfs_mountpoint():
-                devices += [device]
-    if len(devices) == 0:
-        print('No NFS mount points were found')
-        return 1
-
     sample_time = 0
 
+    # make certain devices contains only NFS mount points
+    devices = list_nfs_mounts(origdevices, mountstats)
+    print_iostat_summary(old_mountstats, mountstats, devices, sample_time)
+
     if args.interval is None:
-        print_iostat_summary(old_mountstats, mountstats, devices, sample_time)
         return
 
-    if args.count is not None:
-        count = args.count
-        while count != 0:
-            print_iostat_summary(old_mountstats, mountstats, devices, sample_time)
-            old_mountstats = mountstats
-            time.sleep(args.interval)
-            sample_time = args.interval
-            mountstats = parse_stats_file(args.infile)
+    count = args.count
+    while True:
+        if count is not None:
             count -= 1
-    else: 
-        while True:
-            print_iostat_summary(old_mountstats, mountstats, devices, sample_time)
-            old_mountstats = mountstats
-            time.sleep(args.interval)
-            sample_time = args.interval
-            mountstats = parse_stats_file(args.infile)
+            if count == 0:
+                break
+        time.sleep(args.interval)
+        old_mountstats = mountstats
+        sample_time = args.interval
+        mountstats = parse_stats_file(args.infile)
+        # nfs mountpoints may appear or disappear, so we need to
+        # recheck the devices list each time we parse mountstats
+        devices = list_nfs_mounts(origdevices, mountstats)
+        print_iostat_summary(old_mountstats, mountstats, devices, sample_time)
 
     args.infile.close()
     if args.since:

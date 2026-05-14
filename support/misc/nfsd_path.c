@@ -17,9 +17,23 @@
 #include "xstat.h"
 #include "nfslib.h"
 #include "nfsd_path.h"
+#include "nfs_ucred.h"
 #include "workqueue.h"
 
-static struct xthread_workqueue *nfsd_wq;
+static struct xthread_workqueue *nfsd_wq = NULL;
+
+struct nfsd_task_t {
+        int             ret;
+        void*           data;
+};
+/* Function used to offload tasks that must be ran within the correct
+ * chroot environment.
+ */
+static void
+nfsd_run_task(void (*func)(void*), void* data){
+        nfsd_wq ? xthread_work_run_sync(nfsd_wq, func, data) : func(data);
+};
+
 
 static int
 nfsd_path_isslash(const char *path)
@@ -124,224 +138,177 @@ nfsd_path_init(void)
 }
 
 struct nfsd_stat_data {
-	const char *pathname;
-	struct stat *statbuf;
-	int ret;
-	int err;
+	const char      *pathname;
+	struct stat     *statbuf;
+        int             (*stat_handler)(const char*, struct stat*);
 };
 
 static void
-nfsd_statfunc(void *data)
+nfsd_handle_stat(void *data)
 {
-	struct nfsd_stat_data *d = data;
-
-	d->ret = xstat(d->pathname, d->statbuf);
-	if (d->ret < 0)
-		d->err = errno;
-}
-
-static void
-nfsd_lstatfunc(void *data)
-{
-	struct nfsd_stat_data *d = data;
-
-	d->ret = xlstat(d->pathname, d->statbuf);
-	if (d->ret < 0)
-		d->err = errno;
+        struct nfsd_task_t*     t = data;
+	struct nfsd_stat_data*  d = t->data;
+        t->ret = d->stat_handler(d->pathname, d->statbuf);
 }
 
 static int
-nfsd_run_stat(struct xthread_workqueue *wq,
-		void (*func)(void *),
-		const char *pathname,
-		struct stat *statbuf)
+nfsd_run_stat(const char *pathname,
+	        struct stat *statbuf,
+                int (*handler)(const char*, struct stat*))
 {
-	struct nfsd_stat_data data = {
-		pathname,
-		statbuf,
-		0,
-		0
-	};
-	xthread_work_run_sync(wq, func, &data);
-	if (data.ret < 0)
-		errno = data.err;
-	return data.ret;
+        struct nfsd_task_t      t;
+        struct nfsd_stat_data   d = { pathname, statbuf, handler };
+        t.data = &d;
+        nfsd_run_task(nfsd_handle_stat, &t);
+	return t.ret;
 }
 
 int
 nfsd_path_stat(const char *pathname, struct stat *statbuf)
 {
-	if (!nfsd_wq)
-		return xstat(pathname, statbuf);
-	return nfsd_run_stat(nfsd_wq, nfsd_statfunc, pathname, statbuf);
+        return nfsd_run_stat(pathname, statbuf, stat);
 }
 
 int
-nfsd_path_lstat(const char *pathname, struct stat *statbuf)
-{
-	if (!nfsd_wq)
-		return xlstat(pathname, statbuf);
-	return nfsd_run_stat(nfsd_wq, nfsd_lstatfunc, pathname, statbuf);
-}
-
-struct nfsd_statfs_data {
-	const char *pathname;
-	struct statfs *statbuf;
-	int ret;
-	int err;
+nfsd_path_lstat(const char* pathname, struct stat* statbuf){
+        return nfsd_run_stat(pathname, statbuf, lstat);
 };
 
-static void
-nfsd_statfsfunc(void *data)
-{
-	struct nfsd_statfs_data *d = data;
-
-	d->ret = statfs(d->pathname, d->statbuf);
-	if (d->ret < 0)
-		d->err = errno;
-}
-
-static int
-nfsd_run_statfs(struct xthread_workqueue *wq,
-		  const char *pathname,
-		  struct statfs *statbuf)
-{
-	struct nfsd_statfs_data data = {
-		pathname,
-		statbuf,
-		0,
-		0
-	};
-	xthread_work_run_sync(wq, nfsd_statfsfunc, &data);
-	if (data.ret < 0)
-		errno = data.err;
-	return data.ret;
-}
-
 int
-nfsd_path_statfs(const char *pathname, struct statfs *statbuf)
+nfsd_path_statfs(const char* pathname, struct statfs* statbuf)
 {
-	if (!nfsd_wq)
-		return statfs(pathname, statbuf);
-	return nfsd_run_statfs(nfsd_wq, pathname, statbuf);
-}
+        return nfsd_run_stat(pathname, (struct stat*)statbuf, (int (*)(const char*, struct stat*))statfs);
+};
 
-struct nfsd_realpath_data {
-	const char *pathname;
-	char *resolved;
-	int err;
+struct nfsd_realpath_t {
+        const char*     path;
+        char*           resolved_buf;
+        char*           res_ptr;
 };
 
 static void
 nfsd_realpathfunc(void *data)
 {
-	struct nfsd_realpath_data *d = data;
-
-	d->resolved = realpath(d->pathname, d->resolved);
-	if (!d->resolved)
-		d->err = errno;
+        struct nfsd_realpath_t *d = data;
+        d->res_ptr = realpath(d->path, d->resolved_buf);
 }
 
-char *
-nfsd_realpath(const char *path, char *resolved_path)
+char*
+nfsd_realpath(const char *path, char *resolved_buf)
 {
-	struct nfsd_realpath_data data = {
-		path,
-		resolved_path,
-		0
+        struct nfsd_realpath_t realpath_buf = {
+                .path = path,
+                .resolved_buf = resolved_buf
+        };
+        nfsd_run_task(nfsd_realpathfunc, &realpath_buf);
+        return realpath_buf.res_ptr;
+}
+
+struct nfsd_openat_t {
+	const struct nfs_ucred *cred;
+	const char *path;
+	int dirfd;
+	int flags;
+	int res_fd;
+	int res_error;
+};
+
+static void nfsd_openatfunc(void *data)
+{
+	struct nfsd_openat_t *d = data;
+
+	d->res_fd = openat(d->dirfd, d->path, d->flags);
+	if (d->res_fd == -1)
+		d->res_error = errno;
+}
+
+static void nfsd_cred_openatfunc(void *data)
+{
+	struct nfsd_openat_t *d = data;
+	struct nfs_ucred *saved = NULL;
+	int ret;
+
+	ret = nfs_ucred_swap_effective(d->cred, &saved);
+	if (ret != 0) {
+		d->res_fd = -1;
+		d->res_error = ret;
+		return;
+	}
+
+	nfsd_openatfunc(data);
+
+	if (saved != NULL) {
+		nfs_ucred_swap_effective(saved, NULL);
+		nfs_ucred_free(saved);
+	}
+}
+
+int nfsd_cred_openat(const struct nfs_ucred *cred, int dirfd, const char *path,
+		     int flags)
+{
+	struct nfsd_openat_t open_buf = {
+		.cred = cred,
+		.path = path,
+		.dirfd = dirfd,
+		.flags = flags,
 	};
 
-	if (!nfsd_wq)
-		return realpath(path, resolved_path);
-
-	xthread_work_run_sync(nfsd_wq, nfsd_realpathfunc, &data);
-	if (!data.resolved)
-		errno = data.err;
-	return data.resolved;
+	if (cred)
+		nfsd_run_task(nfsd_cred_openatfunc, &open_buf);
+	else
+		nfsd_run_task(nfsd_openatfunc, &open_buf);
+	if (open_buf.res_fd == -1)
+		errno = open_buf.res_error;
+	return open_buf.res_fd;
 }
 
-struct nfsd_read_data {
-	int fd;
-	char *buf;
-	size_t len;
-	ssize_t ret;
-	int err;
+struct nfsd_rw_data {
+	int             fd;
+	void*           buf;
+	size_t          len;
+        ssize_t         bytes_read;
 };
 
 static void
 nfsd_readfunc(void *data)
 {
-	struct nfsd_read_data *d = data;
-
-	d->ret = read(d->fd, d->buf, d->len);
-	if (d->ret < 0)
-		d->err = errno;
+        struct nfsd_rw_data* t = (struct nfsd_rw_data*)data;
+        t->bytes_read = read(t->fd, t->buf, t->len);
 }
 
 static ssize_t
-nfsd_run_read(struct xthread_workqueue *wq, int fd, char *buf, size_t len)
+nfsd_run_read(int fd, void* buf, size_t len)
 {
-	struct nfsd_read_data data = {
-		fd,
-		buf,
-		len,
-		0,
-		0
-	};
-	xthread_work_run_sync(wq, nfsd_readfunc, &data);
-	if (data.ret < 0)
-		errno = data.err;
-	return data.ret;
+        struct nfsd_rw_data d = { .fd = fd, .buf = buf, .len = len };
+        nfsd_run_task(nfsd_readfunc, &d);
+	return d.bytes_read;
 }
 
 ssize_t
-nfsd_path_read(int fd, char *buf, size_t len)
+nfsd_path_read(int fd, void* buf, size_t len)
 {
-	if (!nfsd_wq)
-		return read(fd, buf, len);
-	return nfsd_run_read(nfsd_wq, fd, buf, len);
+	return nfsd_run_read(fd, buf, len);
 }
-
-struct nfsd_write_data {
-	int fd;
-	const char *buf;
-	size_t len;
-	ssize_t ret;
-	int err;
-};
 
 static void
 nfsd_writefunc(void *data)
 {
-	struct nfsd_write_data *d = data;
-
-	d->ret = write(d->fd, d->buf, d->len);
-	if (d->ret < 0)
-		d->err = errno;
+	struct nfsd_rw_data* d = data;
+	d->bytes_read = write(d->fd, d->buf, d->len);
 }
 
 static ssize_t
-nfsd_run_write(struct xthread_workqueue *wq, int fd, const char *buf, size_t len)
+nfsd_run_write(int fd, void* buf, size_t len)
 {
-	struct nfsd_write_data data = {
-		fd,
-		buf,
-		len,
-		0,
-		0
-	};
-	xthread_work_run_sync(wq, nfsd_writefunc, &data);
-	if (data.ret < 0)
-		errno = data.err;
-	return data.ret;
+        struct nfsd_rw_data d = { .fd = fd, .buf = buf, .len = len };
+        nfsd_run_task(nfsd_writefunc, &d);
+	return d.bytes_read;
 }
 
 ssize_t
-nfsd_path_write(int fd, const char *buf, size_t len)
+nfsd_path_write(int fd, void* buf, size_t len)
 {
-	if (!nfsd_wq)
-		return write(fd, buf, len);
-	return nfsd_run_write(nfsd_wq, fd, buf, len);
+	return nfsd_run_write(fd, buf, len);
 }
 
 #if defined(HAVE_NAME_TO_HANDLE_AT)
@@ -352,23 +319,18 @@ struct nfsd_handle_data {
 	int *mount_id;
 	int flags;
 	int ret;
-	int err;
 };
 
 static void
 nfsd_name_to_handle_func(void *data)
 {
 	struct nfsd_handle_data *d = data;
-
-	d->ret = name_to_handle_at(d->fd, d->path,
-			d->fh, d->mount_id, d->flags);
-	if (d->ret < 0)
-		d->err = errno;
+	d->ret = name_to_handle_at(d->fd, d->path, d->fh, d->mount_id, d->flags);
 }
 
 static int
-nfsd_run_name_to_handle_at(struct xthread_workqueue *wq,
-		int fd, const char *path, struct file_handle *fh,
+nfsd_run_name_to_handle_at(int fd, const char *path,
+                struct file_handle *fh,
 		int *mount_id, int flags)
 {
 	struct nfsd_handle_data data = {
@@ -377,25 +339,19 @@ nfsd_run_name_to_handle_at(struct xthread_workqueue *wq,
 		fh,
 		mount_id,
 		flags,
-		0,
 		0
 	};
 
-	xthread_work_run_sync(wq, nfsd_name_to_handle_func, &data);
-	if (data.ret < 0)
-		errno = data.err;
+	nfsd_run_task(nfsd_name_to_handle_func, &data);
 	return data.ret;
 }
 
 int
-nfsd_name_to_handle_at(int fd, const char *path, struct file_handle *fh,
+nfsd_name_to_handle_at(int fd, const char *path,
+                struct file_handle *fh,
 		int *mount_id, int flags)
 {
-	if (!nfsd_wq)
-		return name_to_handle_at(fd, path, fh, mount_id, flags);
-
-	return nfsd_run_name_to_handle_at(nfsd_wq, fd, path, fh,
-			mount_id, flags);
+        return nfsd_run_name_to_handle_at(fd, path, fh, mount_id, flags);
 }
 #else
 int

@@ -21,7 +21,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/resource.h>
-#include <sys/wait.h>
 
 #include "conffile.h"
 #include "xmalloc.h"
@@ -32,6 +31,7 @@
 #include "nfsd_path.h"
 #include "nfslib.h"
 #include "export.h"
+#include "nfs_ucred.h"
 
 extern void my_svc_run(void);
 
@@ -41,6 +41,8 @@ static struct nfs_fh_len *get_rootfh(struct svc_req *, dirpath *, nfs_export **,
 
 int reverse_resolve = 0;
 int manage_gids;
+int no_netlink;
+int apply_root_cred;
 int use_ipaddr = -1;
 
 /* PRC: a high-availability callout program can be specified with -H
@@ -71,13 +73,15 @@ static struct option longopts[] =
 	{ "num-threads", 1, 0, 't' },
 	{ "reverse-lookup", 0, 0, 'r' },
 	{ "manage-gids", 0, 0, 'g' },
+	{ "no-netlink", 0, 0, 'L' },
 	{ "no-udp", 0, 0, 'u' },
 	{ "log-auth", 0, 0, 'l'},
 	{ "cache-use-ipaddr", 0, 0, 'i'},
 	{ "ttl", 1, 0, 'T'},
+	{ "apply-root-cred", 0, 0, 'c' },
 	{ NULL, 0, 0, 0 }
 };
-static char shortopts[] = "o:nFd:p:P:hH:N:V:vurs:t:gliT:";
+static char shortopts[] = "o:nFd:p:P:hH:N:V:vurs:t:gliT:c";
 
 #define NFSVERSBIT(vers)	(0x1 << (vers - 1))
 #define NFSVERSBIT_ALL		(NFSVERSBIT(2) | NFSVERSBIT(3) | NFSVERSBIT(4))
@@ -119,90 +123,17 @@ cleanup_lockfiles (void)
 	unlink(rmtab.lockfn);
 }
 
-/* Wait for all worker child processes to exit and reap them */
-static void
-wait_for_workers (void)
-{
-	int status;
-	pid_t pid;
-
-	for (;;) {
-
-		pid = waitpid(0, &status, 0);
-
-		if (pid < 0) {
-			if (errno == ECHILD)
-				return; /* no more children */
-			xlog(L_FATAL, "mountd: can't wait: %s\n",
-					strerror(errno));
-		}
-
-		/* Note: because we SIG_IGN'd SIGCHLD earlier, this
-		 * does not happen on 2.6 kernels, and waitpid() blocks
-		 * until all the children are dead then returns with
-		 * -ECHILD.  But, we don't need to do anything on the
-		 * death of individual workers, so we don't care. */
-		xlog(L_NOTICE, "mountd: reaped child %d, status %d\n",
-				(int)pid, status);
-	}
-}
-
-/* Fork num_threads worker children and wait for them */
-static void
-fork_workers(void)
-{
-	int i;
-	pid_t pid;
-
-	xlog(L_NOTICE, "mountd: starting %d threads\n", num_threads);
-
-	for (i = 0 ; i < num_threads ; i++) {
-		pid = fork();
-		if (pid < 0) {
-			xlog(L_FATAL, "mountd: cannot fork: %s\n",
-					strerror(errno));
-		}
-		if (pid == 0) {
-			/* worker child */
-
-			/* Re-enable the default action on SIGTERM et al
-			 * so that workers die naturally when sent them.
-			 * Only the parent unregisters with pmap and
-			 * hence needs to do special SIGTERM handling. */
-			struct sigaction sa;
-			sa.sa_handler = SIG_DFL;
-			sa.sa_flags = 0;
-			sigemptyset(&sa.sa_mask);
-			sigaction(SIGHUP, &sa, NULL);
-			sigaction(SIGINT, &sa, NULL);
-			sigaction(SIGTERM, &sa, NULL);
-
-			/* fall into my_svc_run in caller */
-			return;
-		}
-	}
-
-	/* in parent */
-	wait_for_workers();
-	unregister_services();
-	cleanup_lockfiles();
-	free_state_path_names(&etab);
-	free_state_path_names(&rmtab);
-	xlog(L_NOTICE, "mountd: no more workers, exiting\n");
-	exit(0);
-}
-
 /*
  * Signal handler.
  */
-static void 
+static void
 killer (int sig)
 {
 	unregister_services();
 	if (num_threads > 1) {
 		/* play Kronos and eat our children */
 		kill(0, SIGTERM);
-		wait_for_workers();
+		cache_wait_for_workers("mountd");
 	}
 	cleanup_lockfiles();
 	free_state_path_names(&etab);
@@ -220,7 +151,7 @@ sig_hup (int UNUSED(sig))
 }
 
 bool_t
-mount_null_1_svc(struct svc_req *rqstp, void *UNUSED(argp), 
+mount_null_1_svc(struct svc_req *rqstp, void *UNUSED(argp),
 	void *UNUSED(resp))
 {
 	struct sockaddr *sap = nfs_getrpccaller(rqstp->rq_xprt);
@@ -466,7 +397,10 @@ get_rootfh(struct svc_req *rqstp, dirpath *path, nfs_export **expret,
 	struct nfs_fh_len *fh;
 	char		rpath[MAXPATHLEN+1];
 	char		*p = *path;
+	char		*subpath;
 	char		buf[INET6_ADDRSTRLEN];
+	size_t		epathlen;
+	int		dirfd;
 
 	if (*p == '\0')
 		p = "/";
@@ -486,31 +420,19 @@ get_rootfh(struct svc_req *rqstp, dirpath *path, nfs_export **expret,
 		*error = MNT3ERR_ACCES;
 		return NULL;
 	}
-	if (nfsd_path_stat(p, &stb) < 0) {
-		xlog(L_WARNING, "can't stat exported dir %s: %s",
-				p, strerror(errno));
-		if (errno == ENOENT)
-			*error = MNT3ERR_NOENT;
-		else
-			*error = MNT3ERR_ACCES;
-		return NULL;
-	}
-	if (!S_ISDIR(stb.st_mode) && !S_ISREG(stb.st_mode)) {
-		xlog(L_WARNING, "%s is not a directory or regular file", p);
-		*error = MNT3ERR_NOTDIR;
-		return NULL;
-	}
-	if (nfsd_path_stat(exp->m_export.e_path, &estb) < 0) {
-		xlog(L_WARNING, "can't stat export point %s: %s",
+
+	dirfd = nfsd_openat(AT_FDCWD, exp->m_export.e_path, O_PATH);
+	if (dirfd == -1) {
+		xlog(L_WARNING, "can't open export point %s: %s",
 		     p, strerror(errno));
 		*error = MNT3ERR_NOENT;
 		return NULL;
 	}
-	if (estb.st_dev != stb.st_dev
-	    && !(exp->m_export.e_flags & NFSEXP_CROSSMOUNT)) {
-		xlog(L_WARNING, "request to export directory %s below nearest filesystem %s",
-		     p, exp->m_export.e_path);
+	if (fstat(dirfd, &estb) == -1) {
+		xlog(L_WARNING, "can't stat export point %s: %s",
+		     p, strerror(errno));
 		*error = MNT3ERR_ACCES;
+		close(dirfd);
 		return NULL;
 	}
 	if (exp->m_export.e_mountpoint &&
@@ -521,9 +443,79 @@ get_rootfh(struct svc_req *rqstp, dirpath *path, nfs_export **expret,
 		xlog(L_WARNING, "request to export an unmounted filesystem: %s",
 		     p);
 		*error = MNT3ERR_NOENT;
+		close(dirfd);
 		return NULL;
 	}
 
+	epathlen = strlen(exp->m_export.e_path);
+	if (epathlen > strlen(p)) {
+		xlog(L_WARNING, "raced with change of exported path: %s", p);
+		*error = MNT3ERR_NOENT;
+		close(dirfd);
+		return NULL;
+	}
+	subpath = &p[epathlen];
+	while (*subpath == '/')
+		subpath++;
+	if (*subpath != '\0') {
+		struct nfs_ucred *cred = NULL;
+		int fd;
+
+		/* Load the user cred */
+		if (!apply_root_cred) {
+			nfs_ucred_get(&cred, rqstp, &exp->m_export);
+			if (cred == NULL) {
+				xlog(L_WARNING, "can't retrieve credential");
+				*error = MNT3ERR_ACCES;
+				close(dirfd);
+				return NULL;
+			}
+			if (manage_gids)
+				nfs_ucred_reload_groups(cred, &exp->m_export);
+		}
+
+		/* Just perform a lookup of the path */
+		fd = nfsd_cred_openat(cred, dirfd, subpath, O_PATH);
+		close(dirfd);
+		if (cred)
+			nfs_ucred_free(cred);
+		if (fd == -1) {
+			xlog(L_WARNING, "can't open exported dir %s: %s", p,
+			     strerror(errno));
+			if (errno == ENOENT)
+				*error = MNT3ERR_NOENT;
+			else
+				*error = MNT3ERR_ACCES;
+			return NULL;
+		}
+		if (fstat(fd, &stb) == -1) {
+			xlog(L_WARNING, "can't open exported dir %s: %s", p,
+			     strerror(errno));
+			if (errno == ENOENT)
+				*error = MNT3ERR_NOENT;
+			else
+				*error = MNT3ERR_ACCES;
+			close(fd);
+			return NULL;
+		}
+		close(fd);
+	} else {
+		close(dirfd);
+		stb = estb;
+	}
+
+	if (!S_ISDIR(stb.st_mode) && !S_ISREG(stb.st_mode)) {
+		xlog(L_WARNING, "%s is not a directory or regular file", p);
+		*error = MNT3ERR_NOTDIR;
+		return NULL;
+	}
+	if (estb.st_dev != stb.st_dev
+	    && !(exp->m_export.e_flags & NFSEXP_CROSSMOUNT)) {
+		xlog(L_WARNING, "request to export directory %s below nearest filesystem %s",
+		     p, exp->m_export.e_path);
+		*error = MNT3ERR_ACCES;
+		return NULL;
+	}
 	/* This will be a static private nfs_export with just one
 	 * address.  We feed it to kernel then extract the filehandle,
 	 */
@@ -677,6 +669,7 @@ read_mountd_conf(char **argv)
 
 	xlog_set_debug("mountd");
 	manage_gids = conf_get_bool("mountd", "manage-gids", manage_gids);
+	no_netlink = conf_get_bool("mountd", "no-netlink", no_netlink);
 	descriptors = conf_get_num("mountd", "descriptors", descriptors);
 	port = conf_get_num("mountd", "port", port);
 	num_threads = conf_get_num("mountd", "threads", num_threads);
@@ -710,6 +703,8 @@ read_mountd_conf(char **argv)
 	ttl = conf_get_num("mountd", "ttl", default_ttl);
 	if (ttl > 0)
 		default_ttl = ttl;
+	apply_root_cred = conf_get_bool("mountd", "apply-root-cred",
+					apply_root_cred);
 }
 
 int
@@ -741,6 +736,9 @@ main(int argc, char **argv)
 		switch (c) {
 		case 'g':
 			manage_gids = 1;
+			break;
+		case 'L':
+			no_netlink = 1;
 			break;
 		case 'o':
 			descriptors = atoi(optarg);
@@ -822,6 +820,9 @@ main(int argc, char **argv)
 				usage(argv[0], 1);
 			}
 			default_ttl = ttl;
+			break;
+		case 'c':
+			apply_root_cred = 1;
 			break;
 		case 0:
 			break;
@@ -916,12 +917,23 @@ main(int argc, char **argv)
 	else if (num_threads > MAX_THREADS)
 		num_threads = MAX_THREADS;
 
-	if (num_threads > 1)
-		fork_workers();
+	/* Open cache channel files BEFORE forking so each upcall is
+	 * only handled by one thread.  Kernel provides locking for both
+	 * read and write.
+	 */
+	cache_open();
+
+	if (cache_fork_workers("mountd", num_threads) == 0) {
+		/* We forked, waited, and now need to clean up */
+		unregister_services();
+		cleanup_lockfiles();
+		free_state_path_names(&etab);
+		free_state_path_names(&rmtab);
+		xlog(L_NOTICE, "mountd: no more workers, exiting\n");
+		exit(0);
+	}
 
 	nfsd_path_init();
-	/* Open files now to avoid sharing descriptors among forked processes */
-	cache_open();
 	v4clients_init();
 
 	xlog(L_NOTICE, "Version " VERSION " starting");
@@ -945,6 +957,7 @@ usage(const char *prog, int n)
 "	[-N version|--no-nfs-version version] [-n|--no-tcp]\n"
 "	[-H prog |--ha-callout prog] [-r |--reverse-lookup]\n"
 "	[-s|--state-directory-path path] [-g|--manage-gids]\n"
-"	[-t num|--num-threads=num] [-u|--no-udp]\n", prog);
+"	[-t num|--num-threads=num] [-u|--no-udp]\n"
+"	[-L|--no-netlink]\n", prog);
 	exit(n);
 }

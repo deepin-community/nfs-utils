@@ -8,6 +8,8 @@
 
 struct file_handle;
 struct statfs;
+struct nfsd_task_t;
+struct nfs_ucred;
 
 void 		nfsd_path_init(void);
 
@@ -17,16 +19,23 @@ char *		nfsd_path_prepend_dir(const char *dir, const char *pathname);
 
 int 		nfsd_path_stat(const char *pathname, struct stat *statbuf);
 int 		nfsd_path_lstat(const char *pathname, struct stat *statbuf);
+int		nfsd_cred_openat(const struct nfs_ucred *cred, int dirfd,
+				 const char *path, int flags);
 
 int		nfsd_path_statfs(const char *pathname,
 				   struct statfs *statbuf);
 
 char *		nfsd_realpath(const char *path, char *resolved_path);
 
-ssize_t		nfsd_path_read(int fd, char *buf, size_t len);
-ssize_t		nfsd_path_write(int fd, const char *buf, size_t len);
+ssize_t		nfsd_path_read(int fd, void* buf, size_t len);
+ssize_t		nfsd_path_write(int fd, void* buf, size_t len);
 
 int		nfsd_name_to_handle_at(int fd, const char *path,
 				       struct file_handle *fh,
 				       int *mount_id, int flags);
+
+static inline int nfsd_openat(int dirfd, const char *path, int flags)
+{
+	return nfsd_cred_openat(NULL, dirfd, path, flags);
+}
 #endif

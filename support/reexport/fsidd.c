@@ -3,28 +3,26 @@
 #endif
 
 #include <assert.h>
+#ifdef HAVE_DLFCN_H
 #include <dlfcn.h>
+#endif
 #include <event2/event.h>
-#include <limits.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <sys/random.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <sys/un.h>
-#include <sys/vfs.h>
 #include <unistd.h>
 
 #include "conffile.h"
 #include "reexport_backend.h"
+#include "reexport.h"
 #include "xcommon.h"
 #include "xlog.h"
 
-#define FSID_SOCKET_NAME "fsid.sock"
-
 static struct event_base *evbase;
 static struct reexpdb_backend_plugin *dbbackend = &sqlite_plug_ops;
+
+/* assert_safe() always evalutes it argument, as it might have
+ * a side-effect.  assert() won't if compiled with NDEBUG
+ */
+#define assert_safe(__sideeffect) (__sideeffect ? 0 : ({assert(0) ; 0;}))
 
 static void client_cb(evutil_socket_t cl, short ev, void *d)
 {
@@ -56,12 +54,11 @@ static void client_cb(evutil_socket_t cl, short ev, void *d)
 
 		if (dbbackend->fsidnum_by_path(req_path, &fsidnum, false, &found)) {
 			if (found)
-				assert(asprintf(&answer, "+ %u", fsidnum) != -1);
+				assert_safe(asprintf(&answer, "+ %u", fsidnum) != -1);
 			else
-				assert(asprintf(&answer, "+ ") != -1);
-		
+				assert_safe(asprintf(&answer, "+ ") != -1);
 		} else {
-			assert(asprintf(&answer, "- %s", "Command failed") != -1);
+			assert_safe(asprintf(&answer, "- %s", "Command failed") != -1);
 		}
 
 		(void)send(cl, answer, strlen(answer), 0);
@@ -78,13 +75,13 @@ static void client_cb(evutil_socket_t cl, short ev, void *d)
 
 		if (dbbackend->fsidnum_by_path(req_path, &fsidnum, true, &found)) {
 			if (found) {
-				assert(asprintf(&answer, "+ %u", fsidnum) != -1);
+				assert_safe(asprintf(&answer, "+ %u", fsidnum) != -1);
 			} else {
-				assert(asprintf(&answer, "+ ") != -1);
+				assert_safe(asprintf(&answer, "+ ") != -1);
 			}
 		
 		} else {
-			assert(asprintf(&answer, "- %s", "Command failed") != -1);
+			assert_safe(asprintf(&answer, "- %s", "Command failed") != -1);
 		}
 
 		(void)send(cl, answer, strlen(answer), 0);
@@ -106,15 +103,15 @@ static void client_cb(evutil_socket_t cl, short ev, void *d)
 		}
 
 		if (bad_input) {
-			assert(asprintf(&answer, "- %s", "Command failed: Bad input") != -1);
+			assert_safe(asprintf(&answer, "- %s", "Command failed: Bad input") != -1);
 		} else {
 			if (dbbackend->path_by_fsidnum(fsidnum, &path, &found)) {
 				if (found)
-					assert(asprintf(&answer, "+ %s", path) != -1);
+					assert_safe(asprintf(&answer, "+ %s", path) != -1);
 				else
-					assert(asprintf(&answer, "+ ") != -1);
+					assert_safe(asprintf(&answer, "+ ") != -1);
 			} else {
-				assert(asprintf(&answer, "+ ") != -1);
+				assert_safe(asprintf(&answer, "+ ") != -1);
 			}
 		}
 
@@ -129,7 +126,7 @@ static void client_cb(evutil_socket_t cl, short ev, void *d)
 	} else {
 		char *answer = NULL;
 
-		assert(asprintf(&answer, "- bad command") != -1);
+		assert_safe(asprintf(&answer, "- bad command") != -1);
 		(void)send(cl, answer, strlen(answer), 0);
 
 		free(answer);
@@ -152,6 +149,7 @@ int main(void)
 {
 	struct event *srv_ev;
 	struct sockaddr_un addr;
+	socklen_t addr_len;
 	char *sock_file;
 	int srv;
 
@@ -163,11 +161,16 @@ int main(void)
 
 	sock_file = conf_get_str_with_def("reexport", "fsidd_socket", FSID_SOCKET_NAME);
 
-	unlink(sock_file);
-
 	memset(&addr, 0, sizeof(struct sockaddr_un));
 	addr.sun_family = AF_UNIX;
 	strncpy(addr.sun_path, sock_file, sizeof(addr.sun_path) - 1);
+	addr_len = sizeof(struct sockaddr_un);
+	if (addr.sun_path[0] == '@') {
+		/* "abstract" socket namespace */
+		addr_len = offsetof(struct sockaddr_un, sun_path) + strlen(addr.sun_path);
+		addr.sun_path[0] = 0;
+	} else
+		unlink(sock_file);
 
 	srv = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK, 0);
 	if (srv == -1) {
@@ -175,7 +178,7 @@ int main(void)
 		return 1;
 	}
 
-	if (bind(srv, (const struct sockaddr *)&addr, sizeof(struct sockaddr_un)) == -1) {
+	if (bind(srv, (const struct sockaddr *)&addr, addr_len) == -1) {
 		xlog(L_WARNING, "Unable to bind %s: %m\n", sock_file);
 		return 1;
 	}
