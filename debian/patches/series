@@ -1,8 +1,2 @@
-01-sm-notify-in-sbin.patch
-25-systemd-daemon-paths.patch
 multiarch-kerberos-paths.patch
 always-run-generator.patch
-start-statd-fix-shellcheck-warnings.patch
-fsidd-provide-better-default-socket-name.patch
-nfs-idmapd.service-add-network-online.target-to-Want.patch
-libnfsidmap-try-to-get-the-domain-directly-from-host.patch

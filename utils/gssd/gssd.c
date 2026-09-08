@@ -365,6 +365,12 @@ gssd_read_service_info(int dirfd, struct clnt_info *clp)
 
 fail:
 	printerr(0, "ERROR: failed to parse %s/info\n", clp->relpath);
+	clp->upcall_address = address ? strdup(address) : NULL;
+	clp->upcall_port = port ? strdup(port) : NULL;
+	clp->upcall_program = program;
+	clp->upcall_vers = version;
+	clp->upcall_protoname = protoname ? strdup(protoname) : NULL;
+	clp->upcall_service = service ? strdup(service) : NULL;
 	free(servername);
 	free(protoname);
 	clp->servicename = NULL;
@@ -408,6 +414,16 @@ gssd_free_client(struct clnt_info *clp)
 	free(clp->servicename);
 	free(clp->servername);
 	free(clp->protocol);
+	if (!clp->servername) {
+		if (clp->upcall_address)
+			free(clp->upcall_address);
+		if (clp->upcall_port)
+			free(clp->upcall_port);
+		if (clp->upcall_protoname)
+			free(clp->upcall_protoname);
+		if (clp->upcall_service)
+			free(clp->upcall_service);
+	}
 	free(clp);
 }
 
@@ -446,6 +462,31 @@ gssd_clnt_gssd_cb(int UNUSED(fd), short UNUSED(which), void *data)
 {
 	struct clnt_info *clp = data;
 
+	/* if there was a failure to translate IP to name for this server,
+	 * try again
+	 */
+	if (!clp->servername) {
+	        if (!gssd_addrstr_to_sockaddr((struct sockaddr *)&clp->addr,
+                                 clp->upcall_address, clp->upcall_port ?
+				 clp->upcall_port : "")) {
+			goto do_upcall;
+		}
+		clp->servername = gssd_get_servername(clp->upcall_address,
+				(struct sockaddr *)&clp->addr, clp->upcall_address);
+		if (!clp->servername)
+			goto do_upcall;
+
+		if (asprintf(&clp->servicename, "%s@%s", clp->upcall_service,
+					clp->servername) < 0) {
+			free(clp->servername);
+			clp->servername = NULL;
+			goto do_upcall;
+		}
+		clp->prog = clp->upcall_program;
+		clp->vers = clp->upcall_vers;
+		clp->protocol = strdup(clp->upcall_protoname);
+	}
+do_upcall:
 	handle_gssd_upcall(clp);
 }
 
@@ -518,9 +559,9 @@ scan_active_thread_list(void)
 					do_error_downcall(info->fd, info->uid, -ETIMEDOUT);
 				} else {
 					if (!(info->flags & UPCALL_THREAD_WARNED)) {
-						printerr(0, "watchdog: thread id 0x%lx running for %ld seconds\n",
+						printerr(0, "watchdog: thread id 0x%lx running for %lld seconds\n",
 								info->tid,
-								now.tv_sec - info->timeout.tv_sec + upcall_timeout);
+								(long long int)(now.tv_sec - info->timeout.tv_sec + upcall_timeout));
 						info->flags |= UPCALL_THREAD_WARNED;
 					}
 				}
@@ -1190,6 +1231,12 @@ main(int argc, char *argv[])
 #endif
 
 	daemon_init(fg);
+
+#ifdef HAVE_SET_ALLOWABLE_ENCTYPES
+	rc = get_allowed_enctypes();
+	if (rc)
+		exit(EXIT_FAILURE);
+#endif
 
 	if (gssd_check_mechs() != 0)
 		errx(1, "Problem with gssapi library");
