@@ -99,6 +99,7 @@ subdir = utils/mount
 ACLOCAL_M4 = $(top_srcdir)/aclocal.m4
 am__aclocal_m4_deps = $(top_srcdir)/aclocal/ax_gcc_func_attribute.m4 \
 	$(top_srcdir)/aclocal/bsdsignals.m4 \
+	$(top_srcdir)/aclocal/getrandom.m4 \
 	$(top_srcdir)/aclocal/ipv6.m4 \
 	$(top_srcdir)/aclocal/kerberos5.m4 \
 	$(top_srcdir)/aclocal/keyutils.m4 \
@@ -290,6 +291,7 @@ ETAGS = @ETAGS@
 EXEEXT = @EXEEXT@
 FGREP = @FGREP@
 FILECMD = @FILECMD@
+GETGROUPS_LIB = @GETGROUPS_LIB@
 GREP = @GREP@
 GSSAPI_CFLAGS = @GSSAPI_CFLAGS@
 GSSAPI_LIBS = @GSSAPI_LIBS@
@@ -298,6 +300,7 @@ GSSGLUE_CFLAGS = @GSSGLUE_CFLAGS@
 GSSGLUE_LIBS = @GSSGLUE_LIBS@
 GSSKRB_CFLAGS = @GSSKRB_CFLAGS@
 GSSKRB_LIBS = @GSSKRB_LIBS@
+HAVE_GETRANDOM = @HAVE_GETRANDOM@
 HAVE_LIBWRAP = @HAVE_LIBWRAP@
 HAVE_TCP_WRAPPER = @HAVE_TCP_WRAPPER@
 IDMAPD = @IDMAPD@
@@ -323,9 +326,15 @@ LIBKEYUTILS = @LIBKEYUTILS@
 LIBMOUNT = @LIBMOUNT@
 LIBMOUNT_CFLAGS = @LIBMOUNT_CFLAGS@
 LIBMOUNT_LIBS = @LIBMOUNT_LIBS@
+LIBNL3_CFLAGS = @LIBNL3_CFLAGS@
+LIBNL3_LIBS = @LIBNL3_LIBS@
+LIBNLGENL3_CFLAGS = @LIBNLGENL3_CFLAGS@
+LIBNLGENL3_LIBS = @LIBNLGENL3_LIBS@
 LIBNSL = @LIBNSL@
 LIBOBJS = @LIBOBJS@
 LIBPTHREAD = @LIBPTHREAD@
+LIBREADLINE_CFLAGS = @LIBREADLINE_CFLAGS@
+LIBREADLINE_LIBS = @LIBREADLINE_LIBS@
 LIBS = @LIBS@
 LIBSOCKET = @LIBSOCKET@
 LIBSQLITE = @LIBSQLITE@
@@ -940,7 +949,7 @@ install-exec-hook:
 	  ln -sf mount.nfs mount.nfs4 && \
 	  ln -sf mount.nfs umount.nfs && \
 	  ln -sf mount.nfs umount.nfs4 && \
-	  chmod 4511 mount.nfs )
+	  chmod 4711 mount.nfs )
 uninstall-hook:
 	(cd $(DESTDIR)$(sbindir) && \
 	    rm -f mount.nfs4 umount.nfs umount.nfs4)

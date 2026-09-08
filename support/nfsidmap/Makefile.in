@@ -94,6 +94,7 @@ subdir = support/nfsidmap
 ACLOCAL_M4 = $(top_srcdir)/aclocal.m4
 am__aclocal_m4_deps = $(top_srcdir)/aclocal/ax_gcc_func_attribute.m4 \
 	$(top_srcdir)/aclocal/bsdsignals.m4 \
+	$(top_srcdir)/aclocal/getrandom.m4 \
 	$(top_srcdir)/aclocal/ipv6.m4 \
 	$(top_srcdir)/aclocal/kerberos5.m4 \
 	$(top_srcdir)/aclocal/keyutils.m4 \
@@ -172,13 +173,13 @@ nsswitch_la_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CC $(AM_LIBTOOLFLAGS) \
 	$(LIBTOOLFLAGS) --mode=link $(CCLD) $(AM_CFLAGS) $(CFLAGS) \
 	$(nsswitch_la_LDFLAGS) $(LDFLAGS) -o $@
 regex_la_DEPENDENCIES = ../../support/nfs/libnfsconf.la
-am_regex_la_OBJECTS = regex.lo
+am_regex_la_OBJECTS = regex.lo nfsidmap_common.lo
 regex_la_OBJECTS = $(am_regex_la_OBJECTS)
 regex_la_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CC $(AM_LIBTOOLFLAGS) \
 	$(LIBTOOLFLAGS) --mode=link $(CCLD) $(AM_CFLAGS) $(CFLAGS) \
 	$(regex_la_LDFLAGS) $(LDFLAGS) -o $@
 static_la_DEPENDENCIES = ../../support/nfs/libnfsconf.la
-am_static_la_OBJECTS = static.lo
+am_static_la_OBJECTS = static.lo nfsidmap_common.lo
 static_la_OBJECTS = $(am_static_la_OBJECTS)
 static_la_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CC $(AM_LIBTOOLFLAGS) \
 	$(LIBTOOLFLAGS) --mode=link $(CCLD) $(AM_CFLAGS) $(CFLAGS) \
@@ -186,7 +187,7 @@ static_la_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CC $(AM_LIBTOOLFLAGS) \
 am__DEPENDENCIES_1 =
 umich_ldap_la_DEPENDENCIES = $(am__DEPENDENCIES_1) \
 	../../support/nfs/libnfsconf.la
-am_umich_ldap_la_OBJECTS = umich_ldap.lo
+am_umich_ldap_la_OBJECTS = umich_ldap.lo nfsidmap_common.lo
 umich_ldap_la_OBJECTS = $(am_umich_ldap_la_OBJECTS)
 umich_ldap_la_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CC $(AM_LIBTOOLFLAGS) \
 	$(LIBTOOLFLAGS) --mode=link $(CCLD) $(AM_CFLAGS) $(CFLAGS) \
@@ -308,6 +309,7 @@ ETAGS = @ETAGS@
 EXEEXT = @EXEEXT@
 FGREP = @FGREP@
 FILECMD = @FILECMD@
+GETGROUPS_LIB = @GETGROUPS_LIB@
 GREP = @GREP@
 GSSAPI_CFLAGS = @GSSAPI_CFLAGS@
 GSSAPI_LIBS = @GSSAPI_LIBS@
@@ -316,6 +318,7 @@ GSSGLUE_CFLAGS = @GSSGLUE_CFLAGS@
 GSSGLUE_LIBS = @GSSGLUE_LIBS@
 GSSKRB_CFLAGS = @GSSKRB_CFLAGS@
 GSSKRB_LIBS = @GSSKRB_LIBS@
+HAVE_GETRANDOM = @HAVE_GETRANDOM@
 HAVE_LIBWRAP = @HAVE_LIBWRAP@
 HAVE_TCP_WRAPPER = @HAVE_TCP_WRAPPER@
 IDMAPD = @IDMAPD@
@@ -341,9 +344,15 @@ LIBKEYUTILS = @LIBKEYUTILS@
 LIBMOUNT = @LIBMOUNT@
 LIBMOUNT_CFLAGS = @LIBMOUNT_CFLAGS@
 LIBMOUNT_LIBS = @LIBMOUNT_LIBS@
+LIBNL3_CFLAGS = @LIBNL3_CFLAGS@
+LIBNL3_LIBS = @LIBNL3_LIBS@
+LIBNLGENL3_CFLAGS = @LIBNLGENL3_CFLAGS@
+LIBNLGENL3_LIBS = @LIBNLGENL3_LIBS@
 LIBNSL = @LIBNSL@
 LIBOBJS = @LIBOBJS@
 LIBPTHREAD = @LIBPTHREAD@
+LIBREADLINE_CFLAGS = @LIBREADLINE_CFLAGS@
+LIBREADLINE_LIBS = @LIBREADLINE_LIBS@
 LIBS = @LIBS@
 LIBSOCKET = @LIBSOCKET@
 LIBSQLITE = @LIBSQLITE@
@@ -491,13 +500,13 @@ libnfsidmap_la_LIBADD = -ldl ../../support/nfs/libnfsconf.la
 nsswitch_la_SOURCES = nss.c nfsidmap_common.c
 nsswitch_la_LDFLAGS = -module -avoid-version
 nsswitch_la_LIBADD = ../../support/nfs/libnfsconf.la
-static_la_SOURCES = static.c
+static_la_SOURCES = static.c nfsidmap_common.c
 static_la_LDFLAGS = -module -avoid-version
 static_la_LIBADD = ../../support/nfs/libnfsconf.la
-regex_la_SOURCES = regex.c
+regex_la_SOURCES = regex.c nfsidmap_common.c
 regex_la_LDFLAGS = -module -avoid-version
 regex_la_LIBADD = ../../support/nfs/libnfsconf.la
-umich_ldap_la_SOURCES = umich_ldap.c
+umich_ldap_la_SOURCES = umich_ldap.c nfsidmap_common.c
 umich_ldap_la_LDFLAGS = -module -avoid-version
 umich_ldap_la_LIBADD = -lldap $(KRB5_GSS_LIB) ../../support/nfs/libnfsconf.la
 gums_la_SOURCES = gums.c
